@@ -14,6 +14,12 @@ import streamlit.components.v1 as components
 # =============================================================================
 ARCHIVO_EXCEL = "MAPEO ARANDANOS.xlsx"       # También acepta MAPEO_ARANDANOS.xlsx (guion bajo)
 ARCHIVO_RECEPCION = "BD_IN_26.xlsx"          # Base de recepción: lote, fecha guia, procesado, rechazo
+# Pallets cuya columna "Tipo" contenga alguna de estas palabras NO pertenecen al mapeo de fruta embalada
+# (IQF, IQF Jugo, Fresco sin proceso). Se excluyen y se informan en «Calidad de Datos».
+PALABRAS_TIPO_EXCLUIDO = ["iqf", "fresco"]
+# Valores de la columna "rechazo" de la base de recepción que significan "NO rechazado"
+# (la columna puede venir vacía o con un guion en los pallets normales). Cualquier otro texto = rechazado.
+RECHAZO_SIN_VALOR = {"", "-", "--", "---", ".", "nan", "none", "no", "n/a", "na", "ninguno", "sin rechazo", "0"}
 PALABRA_BULK = "bulk"                        # Formato de recepción que contiene esto = bulk (no se procesa)
 DIAS_ALERTA_DEFECTO = 7          # Alerta si la permanencia es MAYOR a este número de días
                                  # (el día de "Fecha Creacion" cuenta como día 1)
@@ -78,6 +84,13 @@ def limpiar_pallet(v):
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
     return re.sub(r'\.0*$', '', str(v).strip())   # '2027000033.' -> '2027000033'
+
+
+def es_rechazo(v):
+    """True si la celda de la columna 'rechazo' indica un rechazo real (vacío o '-' = no rechazado)."""
+    if pd.isna(v):
+        return False
+    return norm(v) not in RECHAZO_SIN_VALOR
 
 
 def clasificar_posicion(pos):
@@ -245,8 +258,7 @@ def cargar_recepcion():
         'Lote': raw[c_lote].map(limpiar_pallet),
         'Recepcion': pd.to_datetime(raw[c_rec], errors='coerce', dayfirst=True).dt.normalize(),
         'Proceso': pd.to_datetime(raw[c_proc], errors='coerce', dayfirst=True).dt.normalize(),
-        'Rechazado': (raw[c_rech].notna() & (raw[c_rech].astype(str).str.strip() != ''))
-                     if c_rech else pd.Series(False, index=raw.index),
+        'Rechazado': raw[c_rech].map(es_rechazo) if c_rech else pd.Series(False, index=raw.index),
         'Exportadora': texto(c_exp),
         'Variedad': texto(c_var),
         'Bulk': texto(c_for).str.lower().str.contains(PALABRA_BULK, regex=False),
@@ -259,13 +271,18 @@ def cargar_recepcion():
     ok = r[~r['Rechazado']].groupby('Lote').agg(Recepcion=('Recepcion', 'min'), Proceso=('Proceso', 'min'),
                                                 Procesos_Distintos=('Proceso', 'nunique'),
                                                 Pallets_OK=('Lote', 'size'))
+    aviso = None
+    if r['Rechazado'].mean() > 0.5:
+        aviso = (f"⚠️ {r['Rechazado'].mean():.0%} de las filas de la base de recepción figuran como rechazadas. "
+                 f"Revisa los valores de la columna 'rechazo' (valores sin rechazo reconocidos: "
+                 f"{sorted(v for v in RECHAZO_SIN_VALOR if v)}).")
     lotes = todos.join(ok, how='left')
     lotes['Rechazado_Total'] = lotes['Pallets_OK'].isna()
     lotes['Recepcion'] = lotes['Recepcion'].fillna(lotes['Recepcion_Todos'])
     lotes['Pallets_OK'] = lotes['Pallets_OK'].fillna(0).astype(int)
     lotes['Procesos_Distintos'] = lotes['Procesos_Distintos'].fillna(0).astype(int)
     lotes['Pallets_Rechazados'] = lotes['Pallets_Rechazados'].astype(int)
-    return lotes.drop(columns='Recepcion_Todos').reset_index(), None
+    return lotes.drop(columns='Recepcion_Todos').reset_index(), aviso
 
 
 @st.cache_data(ttl=60)
@@ -365,6 +382,12 @@ dias_alerta = st.sidebar.number_input(
     help="El día de 'Fecha Creacion' cuenta como día 1. Con 7, la alerta se activa desde el día 8."
 )
 
+excluir_tipos = st.sidebar.checkbox(
+    "Excluir IQF y fruta fresca sin proceso", value=True,
+    help="Excluye los pallets cuyo 'Tipo' contiene: " + ", ".join(PALABRAS_TIPO_EXCLUIDO)
+         + ". Si algún día necesitas verlos, desmarca esta opción."
+)
+
 with st.sidebar.expander("Columnas detectadas del Excel"):
     for canon, real in mapa_columnas.items():
         st.write(f"**{canon}** ← `{real}`")
@@ -399,6 +422,25 @@ else:
 # Pallets de lotes 100% rechazados: se despachan, no deben figurar (se informan en "Calidad de Datos")
 df_rech = df_all[df_all['Lote_Rechazado']].copy()
 df_all = df_all[~df_all['Lote_Rechazado']].copy()
+
+# Pallets de Tipo IQF / Fresco sin proceso: no pertenecen a este mapeo (se informan en "Calidad de Datos")
+df_all['Excluido_Tipo'] = df_all['Tipo'].map(lambda t: any(w in norm(t) for w in PALABRAS_TIPO_EXCLUIDO))
+if excluir_tipos:
+    df_excl = df_all[df_all['Excluido_Tipo']].copy()
+    df_all = df_all[~df_all['Excluido_Tipo']].copy()
+else:
+    df_excl = df_all.iloc[0:0].copy()
+
+if df_all.empty:
+    st.warning("No quedan registros después de excluir rechazados / IQF / fresco. "
+               "Revisa la columna 'rechazo' de la base de recepción y la columna 'Tipo' del mapeo, "
+               "o desmarca la exclusión en el panel lateral.")
+    st.stop()
+
+# Posiciones con más de un pallet DISTINTO (sobre-apilado), recalculado con los datos ya depurados
+_cod = df_all[df_all['Codificada'] & (df_all['Pallet'] != '')]
+_n = _cod.groupby('Posicion')['Pallet'].nunique()
+df_all['Sobre_apilado'] = df_all['Codificada'] & df_all['Posicion'].isin(set(_n[_n > 1].index))
 
 # Fecha base: proceso del lote; si está en blanco (bulk / pendiente) -> recepción
 fecha_base = df_all['Fecha_Proceso'].fillna(df_all['Fecha_Recepcion'])
@@ -435,6 +477,8 @@ with st.sidebar.expander("Origen de la fecha de antigüedad"):
         st.write(f"**{v}** pallets · {k}")
 if len(df_rech):
     st.sidebar.info(f"🚫 {df_rech['Pallet'].nunique()} pallet(s) de lotes rechazados excluidos")
+if len(df_excl):
+    st.sidebar.info(f"🧹 {df_excl['Pallet'].nunique()} pallet(s) IQF / fresco sin proceso excluidos")
 
 # Filas filtradas por exportadora (todas las filas del Excel)
 df_f = df_all[df_all['Exportadora'].isin(exportadoras_sel)].copy()
@@ -455,6 +499,14 @@ tab_dash, tab_3d, tab_alertas, tab_rec, tab_ajustes, tab_calidad = st.tabs(
 # TAB 1: DASHBOARD
 # -----------------------------------------------------------------------------
 with tab_dash:
+    if len(df_excl) or len(df_rech):
+        partes = []
+        if len(df_excl):
+            partes.append(f"{df_excl['Pallet'].nunique()} pallet(s) de tipo IQF / fresco sin proceso")
+        if len(df_rech):
+            partes.append(f"{df_rech['Pallet'].nunique()} pallet(s) de lotes rechazados")
+        st.warning("🧹 Se excluyeron del análisis " + " y ".join(partes) +
+                   ". Estos registros no deberían estar en el mapeo; revisa el detalle en «Calidad de Datos».")
     n_alertas = int(df_u['Alerta'].sum())
     if n_alertas > 0:
         st.error(f"⚠️ {n_alertas} pallet(s) superan los {dias_alerta} días de permanencia. "
@@ -1230,3 +1282,17 @@ with tab_calidad:
                                                       Pallets=('Pallet', 'nunique'),
                                                       Posiciones=('Posicion', lambda s: ', '.join(sorted(set(s))))
                                                       ).reset_index(), hide_index=True)
+
+    st.markdown("---")
+    st.markdown("### 🧹 Pallets excluidos por Tipo (IQF / fresco sin proceso)")
+    if not excluir_tipos:
+        st.info("La exclusión está desactivada en el panel lateral: estos pallets se están incluyendo en el análisis.")
+    elif df_excl.empty:
+        st.success("No se encontraron pallets de tipo IQF o fresco en el mapeo.")
+    else:
+        st.caption("Estos pallets no pertenecen al mapeo de fruta embalada y no se cuentan en el dashboard, "
+                   "las alertas ni el mapa 3D. Conviene sacarlos del Excel.")
+        mostrar_tabla(df_excl.groupby(['Tipo', 'Lote']).agg(
+            Exportadora=('Exportadora', 'first'), Formato=('Formato', 'first'),
+            Pallets=('Pallet', 'nunique'),
+            Posiciones=('Posicion', lambda x: ', '.join(sorted(set(x))))).reset_index(), hide_index=True)
